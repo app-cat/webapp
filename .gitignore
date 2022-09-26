@@ -1,0 +1,12 @@
+.DS_Store
+.AppleDouble
+.LSOverride
+.idea
+._*
+.Spotlight-V100
+.Trashes
+
+
+
+
+package-lock.json
