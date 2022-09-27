@@ -4,7 +4,18 @@
  */
 
 const fs = require('fs/promises')
+const { createReadStream, createWriteStream } = require('fs')
 const { resolve, join, parse } = require('path')
+
+function ok() {
+  return true
+}
+function noop(err) {
+  return false
+}
+function no(err) {
+  console.error(err + '')
+}
 
 class Stats {
   isFile() {
@@ -21,8 +32,6 @@ class Stats {
   }
 }
 
-const VERSION = +process.versions.node.split('.').slice(0, 2).join('.')
-
 const EMPTY_STAT = new Stats()
 
 const Iofs = {
@@ -34,7 +43,7 @@ const Iofs = {
    * @param  {Function} cb   [回调] 可选
    */
   cat(file) {
-    return fs.readFile(file)
+    return fs.readFile(file).then(ok).catch(no)
   },
 
   /**
@@ -43,22 +52,25 @@ const Iofs = {
    * @param  {boolean} recursive [是否递归遍历子目录]
    * @return {array}      [返回目标目录所有文件名和子目录名, 不包括'.'和'..']
    */
-  async ls(dir, recursive) {
-    let list = fs.readdirSync(dir)
+  ls(dir, recursive) {
+    return fs
+      .readdir(dir)
+      .then(async list => {
+        list.forEach((it, i) => {
+          list[i] = resolve(dir, it)
+        })
 
-    list.forEach((it, i) => {
-      list[i] = resolve(dir, it)
-    })
-
-    if (recursive) {
-      let tmp = list.concat()
-      tmp.forEach(async it => {
-        if (await this.isdir(it)) {
-          list = list.concat(await this.ls(it, recursive))
+        if (recursive) {
+          let tmp = list.concat()
+          for (let it of tmp) {
+            if (await this.isdir(it)) {
+              list = list.concat(await this.ls(it, recursive))
+            }
+          }
         }
+        return list
       })
-    }
-    return list
+      .catch(no)
   },
 
   /**
@@ -68,13 +80,13 @@ const Iofs = {
    * @param  {Boolean} append [是否在后面追加，默认否]
    * @param  {String} encode [编码, 默认utf8]
    */
-  async echo(data, file, append, encode, debug) {
+  async echo(data, file, append, encode) {
     if (!file) {
       return data
     }
 
-    var updir = parse(file).dir
-    var opt = {}
+    let updir = parse(file).dir
+    let opt = {}
     if (!(await this.isdir(updir))) {
       await this.mkdir(updir)
     }
@@ -90,20 +102,20 @@ const Iofs = {
     }
 
     if (!!append) {
-      return fs.appendFile(file, data, opt)
+      return fs.appendFile(file, data, opt).then(ok).catch(no)
     } else {
-      return fs.writeFile(file, data, opt)
+      return fs.writeFile(file, data, opt).then(ok).catch(no)
     }
   },
 
   //修改权限
   chmod(path, mode) {
-    return fs.chmod(path, mode)
+    return fs.chmod(path, mode).then(ok).catch(no)
   },
 
   //修改所属用户
   chown(path, uid, gid) {
-    fs.chown(path, uid, gid)
+    return fs.chown(path, uid, gid).then(ok).catch(no)
   },
 
   /**
@@ -119,10 +131,14 @@ const Iofs = {
 
     return fs.rename(origin, target).catch(async err => {
       if (~err.message.indexOf('cross-device')) {
-        return this.cp(origin, target).then(_ => {
-          this.rm(origin)
-        })
+        return this.cp(origin, target)
+          .then(_ => {
+            this.rm(origin)
+            return true
+          })
+          .catch(no)
       }
+      console.error(err + '')
     })
   },
 
@@ -136,58 +152,45 @@ const Iofs = {
     if (await this.isdir(origin)) {
       await this.mkdir(target)
       let list = await this.ls(origin)
-      list.forEach(val => {
-        let name = parse(val).base
-        this.cp(val, join(target, name))
-      })
+      for (let it of list) {
+        let name = parse(it).base
+        await this.cp(it, join(target, name))
+      }
     } else {
       let updir = parse(target).dir
       if (!(await this.isdir(updir))) {
         await this.mkdir(updir)
       }
 
-      let rs = fs.createReadStream(origin)
-      let ws = fs.createWriteStream(target)
-      rs.pipe(ws)
+      let rs = createReadStream(origin)
+      let ws = createWriteStream(target)
+      return rs
+        .on('error', err => {
+          console.error('???????????', err + '')
+        })
+        .pipe(ws)
     }
+    return true
   },
 
   /**
    * [rm 删除文件/目录]
    * @param  {[type]} origin      [源文件/目录路径]
    */
-  rm(origin, debug) {
-    try {
-      if (this.isdir(origin)) {
-        if (VERSION > 12.1) {
-          FS.rmdirSync(origin, { recursive: true })
-        } else {
-          var list = this.ls(origin)
-          list.forEach(it => this.rm(it))
-          FS.rmdirSync(origin)
-        }
-      } else {
-        FS.unlinkSync(origin)
-      }
-      return true
-    } catch (err) {
-      debug && console.error('call rm(): ', err + '')
-      return false
+  async rm(origin) {
+    if (await this.isdir(origin)) {
+      return fs.rmdir(origin, { recursive: true })
+    } else {
+      return fs.unlink(origin)
     }
   },
 
   /**
    * [stat 返回文件/目录的状态信息]
    * @param  {[string]} path [目标路径]
-   * @param  {[boolean]} debug [是否静默检测, 是否不打印错误日志]
    */
-  stat(path, debug) {
-    try {
-      return FS.statSync(path)
-    } catch (err) {
-      debug && console.error('call stat(): ', err + '')
-      return EMPTY_STAT
-    }
+  stat(path) {
+    return fs.stat(path).catch(err => EMPTY_STAT)
   },
 
   /**
@@ -195,19 +198,11 @@ const Iofs = {
    * @param  {String} path [目标路径]
    */
   isdir(path) {
-    try {
-      return this.stat(path).isDirectory()
-    } catch (err) {
-      return false
-    }
+    return this.stat(path).then(r => r.isDirectory())
   },
 
   isfile(path) {
-    try {
-      return this.stat(path).isFile()
-    } catch (err) {
-      return false
-    }
+    return this.stat(path).then(r => r.isFile())
   },
 
   /**
@@ -215,29 +210,8 @@ const Iofs = {
    * @param  {String} dir [目标路径]
    * @param {Number} mode [目录权限, node v10.12起支持]
    */
-  mkdir(dir, mode = 0o755, debug) {
-    try {
-      if (VERSION > 10.12) {
-        FS.mkdirSync(dir, { recursive: true, mode: mode })
-      } else {
-        var updir = PATH.parse(dir).dir
-        if (!updir) {
-          debug && console.error('call mkdir(): ', 'Wrong dir path')
-          return false
-        }
-
-        if (!this.isdir(updir)) {
-          this.mkdir(updir)
-        }
-
-        FS.mkdirSync(dir)
-        this.chmod(dir, mode)
-      }
-      return true
-    } catch (err) {
-      debug && console.error('call mkdir(): ', err + '')
-      return false
-    }
+  mkdir(dir, mode = 0o755) {
+    return fs.mkdir(dir, { recursive: true, mode: mode })
   },
 
   /**
@@ -245,17 +219,12 @@ const Iofs = {
    * @param  {String} file [目标路径]
    */
   exists(file) {
-    return this.is(file, FS.constants.F_OK)
+    return this.is(file, fs.constants.F_OK)
   },
 
   // 是否可读写
   is(file, mode) {
-    try {
-      FS.accessSync(file, mode)
-      return true
-    } catch (e) {
-      return false
-    }
+    return fs.access(file, mode).then(ok).catch(noop)
   }
 }
 
